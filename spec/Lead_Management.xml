@@ -1,0 +1,38 @@
+<process name="CRM_Lead_Management" targetNamespace="http://crm.ua">
+
+    <activity name="CaptureNewLead">
+        <input name="LeadContactInfo"/>
+        <output name="LeadStatus" value="New"/>
+    </activity>
+
+    <activity name="AssignLeadToOwner">
+        <input name="LeadContactInfo"/>
+        <output name="AssignedManagerID"/>
+    </activity>
+
+    <activity name="QualifyLead">
+        <input name="AssignedManagerID"/>
+        <output name="QualificationResult"/> 
+    </activity>
+
+    <choice>
+        <condition status="QualificationResult" value="Qualified">
+            <sequence>
+                <activity name="CreateAccountAndContact">
+                    <input name="LeadContactInfo"/>
+                </activity>
+                <activity name="CreateOpportunity">
+                    <output name="OpportunityStatus" value="Proposal_Sent"/>
+                </activity>
+            </sequence>
+        </condition>
+
+        <condition status="QualificationResult" value="Disqualified">
+            <activity name="ArchiveLead">
+                <output name="LeadStatus" value="Lost"/>
+                <input name="ReasonForLoss"/>
+            </activity>
+        </condition>
+    </choice>
+
+</process>
