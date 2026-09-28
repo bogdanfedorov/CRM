@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Abstract CRM Core Engine + DLC/Mod system, described in BPML 1.0 style.
+  Layers:
+    1. Core        - domain-agnostic entities, pipeline engine, event bus
+    2. ModHost     - mod/DLC lifecycle (manifest -> validate -> activate)
+    3. Mods        - domain extensions (education, ecommerce, recruiting)
+-->
+<definitions xmlns="http://www.bpmi.org/2002/BPML"
+             xmlns:core="urn:crm:core"
+             xmlns:mod="urn:crm:modhost"
+             xmlns:edu="urn:crm:mod:education"
+             xmlns:shop="urn:crm:mod:ecommerce"
+             xmlns:rec="urn:crm:mod:recruiting">
+
+  <!-- ================= SCHEMAS: core base entities ================= -->
+  <schema name="core:Schema">
+    <element name="Party"    note="Abstract participant: Person | Organization; mods add roles"/>
+    <element name="Role"     note="Party role in a domain: Student, Buyer, Candidate, Employer..."/>
+    <element name="Case"     note="Universal unit of work: Deal/Order/Enrollment/Application"/>
+    <element name="Pipeline" note="Set of Stages + transition rules; mods register their own"/>
+    <element name="Activity" note="Call, email, meeting, task, event"/>
+    <element name="Extension" note="Arbitrary fields/types added by mods (typed custom attributes)"/>
+  </schema>
+
+  <!-- ================= CORE: event bus ================= -->
+  <signal name="core:EventBus" note="All state changes are published as events; mods subscribe"/>
+  <event name="core:PartyCreated"/>
+  <event name="core:CaseCreated"/>
+  <event name="core:CaseStageChanged"/>
+  <event name="core:ActivityCompleted"/>
+  <event name="mod:ModActivated"/>
+
+  <!-- ================= CORE: Case lifecycle via Pipeline ================= -->
+  <process name="core:CaseLifecycle">
+    <input name="caseType"/>
+    <input name="partyId"/>
+    <context>
+      <property name="caseId"/>
+      <property name="pipeline"/>
+      <property name="stage"/>
+    </context>
+
+    <sequence>
+      <call process="core:ResolvePipeline" instance="caseType" output="pipeline"/>
+      <action name="createCase" operation="core:Case.create"/>
+      <assign property="stage" from="pipeline/initialStage"/>
+      <raise event="core:CaseCreated"/>
+
+      <until condition="pipeline/isTerminal(stage)">
+        <sequence>
+          <!-- before-hooks: mods can block or enrich the transition -->
+          <call process="core:RunHooks" hookPoint="beforeTransition"/>
+          <choice>
+            <event name="core:ActivityCompleted" correlates="caseId"/>
+            <event name="core:ManualTransition"  correlates="caseId"/>
+            <delay duration="pipeline/stage/slaTimeout"/>
+          </choice>
+          <switch>
+            <case condition="pipeline/guard(stage, event) = true">
+              <sequence>
+                <assign property="stage" from="pipeline/next(stage, event)"/>
+                <raise event="core:CaseStageChanged"/>
+                <call process="core:RunHooks" hookPoint="afterTransition"/>
+              </sequence>
+            </case>
+            <default>
+              <action name="notifyGuardRejected" operation="core:Audit.log"/>
+            </default>
+          </switch>
+        </sequence>
+      </until>
+    </sequence>
+
+    <exception name="hookVeto">
+      <sequence><action operation="core:Audit.log"/><compensate/></sequence>
+    </exception>
+  </process>
+
+  <!-- Pipeline resolution: base + mod overrides (by priority) -->
+  <process name="core:ResolvePipeline">
+    <sequence>
+      <action operation="core:Registry.lookup" registry="pipelines"/>
+      <foreach select="mod:activeMods() ordered by priority">
+        <action operation="mod:applyPipelinePatch"/>
+      </foreach>
+    </sequence>
+  </process>
+
+  <!-- Hook execution: all subscribed mods, isolated -->
+  <process name="core:RunHooks">
+    <input name="hookPoint"/>
+    <all>
+      <foreach select="mod:hooksFor(hookPoint)">
+        <transaction>
+          <action operation="mod:invokeSandboxed" timeout="PT5S"/>
+          <exception name="modFault">
+            <!-- a mod failure does not crash the core -->
+            <action operation="core:Audit.log"/>
+          </exception>
+        </transaction>
+      </foreach>
+    </all>
+  </process>
+
+  <!-- ================= MOD HOST: DLC/Mod lifecycle ================= -->
+  <process name="mod:InstallAndActivate">
+    <input name="package"/>
+    <sequence>
+      <action name="readManifest"       operation="mod:Manifest.parse"/>
+      <!-- manifest: id, version, requires[core>=x, mods...], permissions, extensionPoints -->
+      <action name="verifySignature"    operation="mod:Security.verify"/>
+      <action name="resolveDependencies" operation="mod:Deps.resolve"/>
+      <switch>
+        <case condition="conflicts(package) = true">
+          <fault name="mod:ConflictDetected"/>
+        </case>
+      </switch>
+      <action name="migrateSchema"      operation="mod:Schema.migrate"/>
+      <all>
+        <action operation="mod:registerEntityExtensions"/>
+        <action operation="mod:registerPipelines"/>
+        <action operation="mod:registerHooks"/>
+        <action operation="mod:registerWorkflows"/>
+        <action operation="mod:registerUiSlots"/>
+        <action operation="mod:registerPermissions"/>
+      </all>
+      <raise event="mod:ModActivated"/>
+    </sequence>
+    <exception name="anyFailure">
+      <compensate/> <!-- rollback of migrations and registrations -->
+    </exception>
+  </process>
+
+  <!-- ================= MOD: EDUCATION (online/offline schools) ================= -->
+  <process name="edu:EnrollmentFlow">
+    <context><property name="format" note="online | offline | hybrid"/></context>
+    <sequence>
+      <action name="leadCaptured"     operation="core:Party.create" role="edu:Prospect"/>
+      <action name="trialLesson"      operation="core:Activity.schedule"/>
+      <choice>
+        <event name="edu:TrialAttended"/>
+        <delay duration="P7D"/>
+      </choice>
+      <action name="createEnrollment" operation="core:Case.create" type="edu:Enrollment"/>
+      <switch>
+        <case condition="format = 'online'">
+          <action operation="edu:provisionLMSAccess"/>
+        </case>
+        <case condition="format = 'offline'">
+          <sequence>
+            <action operation="edu:assignGroupAndRoom"/>
+            <action operation="edu:reserveSeat"/>
+          </sequence>
+        </case>
+        <default><all>
+          <action operation="edu:provisionLMSAccess"/>
+          <action operation="edu:assignGroupAndRoom"/>
+        </all></default>
+      </switch>
+      <call process="shop:PaymentFlow" note="reuse of other mods via dependency"/>
+      <spawn process="edu:AttendanceTracking"/>
+      <spawn process="edu:ProgressAndRetention"/>
+    </sequence>
+  </process>
+
+  <process name="edu:AttendanceTracking">
+    <while condition="enrollment/isActive">
+      <sequence>
+        <event name="edu:LessonHeld"/>
+        <action operation="edu:markAttendance"/>
+        <switch>
+          <case condition="missedInRow >= 3">
+            <action operation="core:Activity.create" type="task" note="contact the student"/>
+          </case>
+        </switch>
+      </sequence>
+    </while>
+  </process>
+
+  <!-- ================= MOD: E-COMMERCE ================= -->
+  <process name="shop:OrderFlow">
+    <sequence>
+      <action name="cartUpdated"      operation="shop:Cart.sync"/>
+      <choice>
+        <event name="shop:CheckoutStarted"/>
+        <delay duration="PT24H"/> <!-- abandoned cart -->
+      </choice>
+      <switch>
+        <case condition="cart/abandoned">
+          <call process="shop:AbandonedCartRecovery"/>
+        </case>
+        <default>
+          <sequence>
+            <action operation="core:Case.create" type="shop:Order"/>
+            <call process="shop:PaymentFlow"/>
+            <all>
+              <action operation="shop:reserveStock"/>
+              <action operation="shop:calcShipping"/>
+            </all>
+            <action operation="shop:fulfill"/>
+            <choice>
+              <event name="shop:Delivered"/>
+              <event name="shop:ReturnRequested">
+                <call process="shop:ReturnFlow"/>
+              </event>
+            </choice>
+          </sequence>
+        </default>
+      </switch>
+    </sequence>
+    <exception name="paymentFailed"><compensate/></exception>
+  </process>
+
+  <process name="shop:PaymentFlow">
+    <transaction>
+      <sequence>
+        <action operation="shop:Payment.authorize"/>
+        <action operation="shop:Payment.capture"/>
+      </sequence>
+      <exception name="declined"><action operation="core:Activity.create" type="task"/></exception>
+    </transaction>
+  </process>
+
+  <!-- ================= MOD: RECRUITING (two sides) ================= -->
+  <!-- Employer side -->
+  <process name="rec:EmployerSide">
+    <sequence>
+      <action name="registerEmployer"  operation="core:Party.create" role="rec:Employer"/>
+      <action name="publishVacancy"    operation="core:Case.create"  type="rec:Vacancy"/>
+      <spawn process="rec:Matching"/>
+      <until condition="vacancy/status = 'filled' or vacancy/status = 'closed'">
+        <choice>
+          <event name="rec:ApplicationReceived">
+            <call process="rec:ScreeningPipeline"/>
+          </event>
+          <event name="rec:VacancyExpired"><action operation="rec:closeVacancy"/></event>
+        </choice>
+      </until>
+      <action name="invoiceEmployer"   operation="rec:billPlacement"/>
+    </sequence>
+  </process>
+
+  <!-- Candidate side -->
+  <process name="rec:CandidateSide">
+    <sequence>
+      <action name="registerCandidate" operation="core:Party.create" role="rec:Candidate"/>
+      <action name="buildProfile"      operation="rec:Profile.enrich"/>
+      <spawn process="rec:Matching"/>
+      <choice>
+        <event name="rec:InvitedToInterview"/>
+        <event name="rec:AppliedManually"/>
+      </choice>
+      <action name="applicationCase"   operation="core:Case.create" type="rec:Application"/>
+    </sequence>
+  </process>
+
+  <!-- Shared process: matching the two sides -->
+  <process name="rec:Matching">
+    <while condition="true">
+      <sequence>
+        <event name="rec:VacancyOrProfileChanged"/>
+        <action operation="rec:computeMatchScore"/>
+        <switch>
+          <case condition="score >= threshold">
+            <all>
+              <action operation="core:Activity.create" target="employer" type="suggestion"/>
+              <action operation="core:Activity.create" target="candidate" type="suggestion"/>
+            </all>
+          </case>
+        </switch>
+      </sequence>
+    </while>
+  </process>
+
+  <process name="rec:ScreeningPipeline">
+    <sequence>
+      <action operation="rec:autoScreen"/>
+      <action operation="rec:phoneScreen"/>
+      <action operation="rec:technicalInterview"/>
+      <action operation="rec:finalInterview"/>
+      <switch>
+        <case condition="decision = 'offer'">
+          <sequence>
+            <action operation="rec:sendOffer"/>
+            <choice>
+              <event name="rec:OfferAccepted"><action operation="rec:markHired"/></event>
+              <event name="rec:OfferDeclined"><call process="rec:ScreeningPipeline" note="next candidate"/></event>
+            </choice>
+          </sequence>
+        </case>
+        <default><action operation="rec:sendRejection"/></default>
+      </switch>
+    </sequence>
+  </process>
+
+  <!-- ================= Example mod manifest (declarative) ================= -->
+  <participant name="mod:Manifest.example">
+    <mod id="crm.mod.education" version="1.0.0">
+      <requires core=">=1.0" mods="crm.mod.ecommerce.payments"/>
+      <permissions>
+        <grant scope="core:Party" access="read,write"/>
+        <grant scope="core:Case"  access="read,write"/>
+      </permissions>
+      <extensionPoints>
+        <entity   name="edu:Enrollment" extends="core:Case"/>
+        <role     name="edu:Student"    extends="core:Role"/>
+        <pipeline name="edu:EnrollmentPipeline"/>
+        <hook     point="beforeTransition" handler="edu:checkSeatAvailable"/>
+        <uiSlot   name="party.detail.tabs" component="edu:ProgressTab"/>
+      </extensionPoints>
+    </mod>
+  </participant>
+</definitions>
